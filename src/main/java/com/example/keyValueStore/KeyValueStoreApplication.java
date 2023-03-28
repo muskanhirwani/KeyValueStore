@@ -2,19 +2,11 @@ package com.example.keyValueStore;
 
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
-import org.springframework.web.bind.annotation.RestController;
-
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.*;
 
-
-import java.util.ArrayList;
-import java.util.List;
+import java.util.LinkedList;
 import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
@@ -23,45 +15,48 @@ import java.util.concurrent.ConcurrentHashMap;
 @RestController
 @SpringBootApplication
 public class KeyValueStoreApplication {
-	private static final Map<String, KeyValue> store = new ConcurrentHashMap<>();
-	public Queue<KeyValue> queue = new Queue<>() {
-	};
+	private static final Map<String, String> store = new ConcurrentHashMap<>();
+	private static final Map<String, Queue<String>> queues = new ConcurrentHashMap<>();
+
 
 	public static void main(String[] args) {
 		SpringApplication.run(KeyValueStoreApplication.class, args);
 	}
 
 	@PostMapping("/set/{key}")
-	public ResponseEntity<String> set(@PathVariable String key, @RequestBody KeyValue value,
+	public ResponseEntity<String> set(@PathVariable String key, @RequestBody String value,
 									  @RequestParam(required = false) Integer expiry, @RequestParam(required = false) String condition) {
-		if (condition != null && !"NX".equals(condition) && !"XX".equals(condition)) {
-			return ResponseEntity.badRequest().body("Invalid condition");
+		if (expiry != null && expiry <= 0) {
+			return ResponseEntity.badRequest().body("Invalid expiry value");
 		}
 
-		KeyValue existing = store.get(key);
-		if (existing != null && "NX".equals(condition)) {
+		boolean keyExists = store.containsKey(key);
+		if (condition != null && condition.equalsIgnoreCase("NX") && keyExists) {
 			return ResponseEntity.status(HttpStatus.CONFLICT).body("Key already exists");
 		}
-		if (existing == null && "XX".equals(condition)) {
+		if (condition != null && condition.equalsIgnoreCase("XX") && !keyExists) {
 			return ResponseEntity.status(HttpStatus.CONFLICT).body("Key does not exist");
 		}
 
-		if (expiry != null) {
-			value.setExpiry(System.currentTimeMillis() + expiry * 1000L);
-		}
-
 		store.put(key, value);
+		if (expiry != null) {
+			Thread t = new Thread(() -> {
+				try {
+					Thread.sleep(expiry * 1000L);
+					store.remove(key);
+				} catch (InterruptedException e) {
+					e.printStackTrace();
+				}
+			});
+			t.start();
+		}
 		return ResponseEntity.ok().build();
 	}
 
 	@GetMapping("/get/{key}")
-	public ResponseEntity<KeyValue> get(@PathVariable String key) {
-		KeyValue value = store.get(key);
+	public ResponseEntity<String> get(@PathVariable String key) {
+		String value = store.get(key);
 		if (value == null) {
-			return ResponseEntity.notFound().build();
-		}
-		if (value.isExpired()) {
-			store.remove(key);
 			return ResponseEntity.notFound().build();
 		}
 		return ResponseEntity.ok(value);
@@ -69,55 +64,48 @@ public class KeyValueStoreApplication {
 
 	@PostMapping("/qpush/{key}")
 	public ResponseEntity<String> qpush(@PathVariable String key, @RequestBody String[] values) {
-		KeyValue existing = store.get(key);
-		if (existing == null) {
-			existing = new KeyValue();
-			store.put(key, existing);
+		queues.putIfAbsent(key, new LinkedList<String>());
+		Queue<String> queue = queues.get(key);
+		for (String value : values) {
+			queue.offer(value);
 		}
-		existing.push(values);
 		return ResponseEntity.ok().build();
 	}
 
 	@GetMapping("/qpop/{key}")
 	public ResponseEntity<String> qpop(@PathVariable String key) {
-		KeyValue value = store.get(key);
+		Queue<String> queue = queues.get(key);
+		if (queue == null) {
+			return ResponseEntity.notFound().build();
+		}
+		String value = queue.poll();
 		if (value == null) {
 			return ResponseEntity.notFound().build();
 		}
-		String result = value.toString();
-		if (result == null) {
-			store.remove(key);
-			return ResponseEntity.notFound().build();
-		}
-		return ResponseEntity.ok(result);
+		return ResponseEntity.ok(value);
 	}
 
 	@GetMapping("/bqpop/{key}")
 	public ResponseEntity<String> bqpop(@PathVariable String key, @RequestParam(defaultValue = "0") double timeout) throws InterruptedException {
-		synchronized (store) {
-			KeyValue value = store.get(key);
-			if (value == null) {
-				return ResponseEntity.notFound().build();
-			}
-			String result = value.toString();
-			if (result != null) {
-				return ResponseEntity.ok(result);
-			}
-			if (timeout == 0) {
-				return ResponseEntity.notFound().build();
-			}
-			long start = System.currentTimeMillis();
-			long duration = (long) (timeout * 1000);
-			while (true) {
-				store.wait(duration);
-				value = store.get(key);
-				if (value == null) {
-					return ResponseEntity.notFound().build();
+		Queue<String> queue = queues.get(key);
+		if (queue == null) {
+			return ResponseEntity.notFound().build();
+		}
+		synchronized (queue) {
+			if (queue.isEmpty()) {
+				try {
+					queue.wait((long) (timeout * 1000L));
+				} catch (InterruptedException e) {
+					e.printStackTrace();
 				}
-				result = value.toString();
-
-
 			}
+			if (queue.isEmpty()) {
+				return ResponseEntity.notFound().build();
+			}
+			String value = queue.poll();
+			return ResponseEntity.ok(value);
+		}
+
+
 		}
 	}
-}
